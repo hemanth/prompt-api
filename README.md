@@ -314,6 +314,64 @@ The returned value will be a string that matches the input `RegExp`. If the user
 
 If a value that is neither a `RegExp` object or a valid JSON schema object is given, the method will error with a `TypeError`.
 
+By default, the implementation may include the schema or regular expression as part of the message sent to the underlying language model, which will use up some of the [input quota](#tokenization-context-window-length-limits-and-overflow). You can measure how much it will use up by passing the `responseConstraint` option to `session.measureInputUsage()`. If you want to avoid this behavior, you can use the `omitResponseConstraintInput` option. In such cases, it's strongly recommended to include some guidance in the prompt string itself:
+
+```js
+const result = await session.prompt(`
+  Summarize this feedback into a rating between 0-5, only outputting a JSON
+  object { rating }, with a single property whose value is a number:
+  The food was delicious, service was excellent, will recommend.
+`, { responseConstraint: schema, omitResponseConstraintInput: true });
+```
+
+If `omitResponseConstraintInput` is set to `true` without `responseConstraint` set, then the method will error with a `TypeError`.
+
+### Constraining responses by providing a prefix
+
+As discussed in [Customizing the role per prompt](#customizing-the-role-per-prompt), it is possible to prompt the language model to add a new `"assistant"`-role response in addition to a previous one. Usually it will elaborate on its previous messages. For example:
+
+```js
+const followup = await session.prompt([
+[
+    {
+      role: "user",
+      content: "I'm nervous about my presentation tomorrow"
+    },
+    {
+      role: "assistant"
+      content: "Presentations are tough!"
+    }
+  ]
+]);
+
+// `followup` might be something like "Here are some tips for staying calm.", or
+// "I remember my first presentation, I was nervous too!" or...
+```
+
+In some cases, instead of asking for a new response message, you want to "prefill" part of the `"assistant"`-role response message. An example use case is to guide the language model toward specific response formats. To do this, add `prefix: true` to the trailing `"assistant"`-role message. For example:
+
+```js
+const characterSheet = await session.prompt([
+  {
+    role: "user",
+    content: "Create a TOML character sheet for a gnome barbarian"
+  },
+  {
+    role: "assistant",
+    content: "```toml\n",
+    prefix: true
+  }
+]);
+```
+
+(Such examples work best if we also support [stop sequences](https://github.com/webmachinelearning/prompt-api/issues/44); stay tuned for that!)
+
+Without this continuation, the output might be something like "Sure! Here's a TOML character sheet...". Whereas the prefix message sets the assistant on the right path immediately.
+
+(Kudos to the [Standard Completions project](https://standardcompletions.org/) for [discussion](https://github.com/standardcompletions/rfcs/pull/8) of this functionality, as well as [the example](https://x.com/stdcompletions/status/1928565134080778414).)
+
+If `prefix` is used in any message besides a final `"assistant"`-role one, a `"SyntaxError"` `DOMException` will occur.
+
 ### Appending messages without prompting for a response
 
 In some cases, you know which messages you'll want to use to populate the session, but not yet the final message before you prompt the model for a response. Because processing messages can take some time (especially for multimodal inputs), it's useful to be able to send such messages to the model ahead of time. This allows it to get a head-start on processing, while you wait for the right time to prompt for a response.
@@ -684,119 +742,6 @@ Finally, note that there is a sort of precedent in the (never-shipped) [`FetchOb
 </details>
 
 ## Detailed design
-
-### Full API surface in Web IDL
-
-```webidl
-[Exposed=Window, SecureContext]
-interface LanguageModel : EventTarget {
-  static Promise<LanguageModel> create(optional LanguageModelCreateOptions options = {});
-  static Promise<Availability> availability(optional LanguageModelCreateCoreOptions options = {});
-  static Promise<LanguageModelParams?> params();
-
-  // These will throw "NotSupportedError" DOMExceptions if role = "system"
-  Promise<DOMString> prompt(
-    LanguageModelPrompt input,
-    optional LanguageModelPromptOptions options = {}
-  );
-  ReadableStream promptStreaming(
-    LanguageModelPrompt input,
-    optional LanguageModelPromptOptions options = {}
-  );
-  Promise<undefined> append(
-    LanguageModelPrompt input,
-    optional LanguageModelAppendOptions options = {}
-  );
-
-  Promise<double> measureInputUsage(
-    LanguageModelPrompt input,
-    optional LanguageModelPromptOptions options = {}
-  );
-  readonly attribute double inputUsage;
-  readonly attribute unrestricted double inputQuota;
-  attribute EventHandler onquotaoverflow;
-
-  readonly attribute unsigned long topK;
-  readonly attribute float temperature;
-
-  Promise<LanguageModel> clone(optional LanguageModelCloneOptions options = {});
-  undefined destroy();
-};
-
-[Exposed=Window, SecureContext]
-interface LanguageModelParams {
-  readonly attribute unsigned long defaultTopK;
-  readonly attribute unsigned long maxTopK;
-  readonly attribute float defaultTemperature;
-  readonly attribute float maxTemperature;
-};
-
-dictionary LanguageModelCreateCoreOptions {
-  // Note: these two have custom out-of-range handling behavior, not in the IDL layer.
-  // They are unrestricted double so as to allow +Infinity without failing.
-  unrestricted double topK;
-  unrestricted double temperature;
-
-  sequence<LanguageModelExpected> expectedInputs;
-  sequence<LanguageModelExpected> expectedOutputs;
-};
-
-dictionary LanguageModelCreateOptions : LanguageModelCreateCoreOptions {
-  AbortSignal signal;
-  AICreateMonitorCallback monitor;
-
-  sequence<LanguageModelMessage> initialPrompts;
-};
-
-dictionary LanguageModelPromptOptions {
-  object responseConstraint;
-  AbortSignal signal;
-};
-
-dictionary LanguageModelAppendOptions {
-  AbortSignal signal;
-};
-
-dictionary LanguageModelCloneOptions {
-  AbortSignal signal;
-};
-
-dictionary LanguageModelExpected {
-  required LanguageModelMessageType type;
-  sequence<DOMString> languages;
-};
-
-// The argument to the prompt() method and others like it
-
-typedef (
-  sequence<LanguageModelMessage>
-  // Shorthand for `[{ role: "user", content: [{ type: "text", value: providedValue }] }]`
-  or DOMString
-) LanguageModelPrompt;
-
-dictionary LanguageModelMessage {
-  required LanguageModelMessageRole role;
-
-  // The DOMString branch is shorthand for `[{ type: "text", value: providedValue }]`
-  required (DOMString or sequence<LanguageModelMessageContent>) content;
-};
-
-dictionary LanguageModelMessageContent {
-  required LanguageModelMessageType type;
-  required LanguageModelMessageValue value;
-};
-
-enum LanguageModelMessageRole { "system", "user", "assistant" };
-
-enum LanguageModelMessageType { "text", "image", "audio" };
-
-typedef (
-  ImageBitmapSource
-  or AudioBuffer
-  or BufferSource
-  or DOMString
-) LanguageModelMessageValue;
-```
 
 ### Instruction-tuned versus base models
 
